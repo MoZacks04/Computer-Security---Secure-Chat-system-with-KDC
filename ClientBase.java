@@ -1,0 +1,209 @@
+import javax.crypto.SecretKey;
+import java.io.ObjectInputStream;
+import java.io.ObjectOutputStream;
+import java.net.Socket;
+import java.security.KeyPair;
+import java.security.PublicKey;
+import java.util.Base64;
+import java.util.Map;
+import java.util.Scanner;
+import java.util.concurrent.ConcurrentHashMap;
+
+public class ClientBase {
+
+    private static final String HOST = "localhost";
+    private static final int PORT = 5000;
+    private static final long MAX_CLOCK_SKEW_MS = 60_000;
+
+    protected final String clientId;
+
+    private Socket socket;
+    private ObjectOutputStream out;
+    private ObjectInputStream in;
+
+    private KeyPair myKeyPair;
+    private PublicKey kdcPublicKey;
+    private SecretKey groupKey;
+
+    private final Map<String, PublicKey> publicKeyDirectory = new ConcurrentHashMap<>();
+    private final ReplayCache replayCache = new ReplayCache();
+
+    private volatile ChatPacket lastSentPacket = null;
+
+    public ClientBase(String clientId) {
+        this.clientId = clientId;
+    }
+
+    public void start() throws Exception {
+        myKeyPair = CryptoUtil.generateRSAKeyPair();
+
+        socket = new Socket(HOST, PORT);
+        out = new ObjectOutputStream(socket.getOutputStream());
+        out.flush();
+        in = new ObjectInputStream(socket.getInputStream());
+
+        RegisterMessage reg = new RegisterMessage(clientId, myKeyPair.getPublic().getEncoded());
+        out.writeObject(reg);
+        out.flush();
+
+        System.out.println("[" + clientId + "] Connected to KDC.");
+        System.out.println("[" + clientId + "] Waiting for authenticated group key Ks...");
+
+        Object obj = in.readObject();
+        if (!(obj instanceof KeyResponse)) {
+            throw new RuntimeException("Expected KeyResponse from KDC.");
+        }
+
+        processKeyResponse((KeyResponse) obj);
+
+        System.out.println("\n[" + clientId + "] Ready.");
+        System.out.println("Type a chat message and press Enter.");
+        System.out.println("Use /replaylast to resend your previous packet and demonstrate replay protection.\n");
+
+        startReceiverThread();
+        inputLoop();
+    }
+
+    private void processKeyResponse(KeyResponse response) throws Exception {
+        kdcPublicKey = CryptoUtil.bytesToPublicKey(response.kdcPublicKeyEncoded);
+
+        boolean ok = CryptoUtil.verify(
+                response.encryptedGroupKey,
+                response.kdcSignature,
+                kdcPublicKey
+        );
+
+        if (!ok) {
+            throw new SecurityException("KDC signature verification failed.");
+        }
+
+        byte[] groupKeyBytes = CryptoUtil.rsaDecrypt(
+                response.encryptedGroupKey,
+                myKeyPair.getPrivate()
+        );
+
+        groupKey = CryptoUtil.bytesToAESKey(groupKeyBytes);
+
+        for (Map.Entry<String, byte[]> e : response.allClientPublicKeys.entrySet()) {
+            publicKeyDirectory.put(e.getKey(), CryptoUtil.bytesToPublicKey(e.getValue()));
+        }
+
+        System.out.println("[" + clientId + "] Authenticated key distribution successful.");
+        System.out.println("[" + clientId + "] Shared group key Ks received.");
+        System.out.println("[" + clientId + "] Known clients: " + publicKeyDirectory.keySet());
+    }
+
+    private void inputLoop() throws Exception {
+        Scanner scanner = new Scanner(System.in);
+
+        while (true) {
+            String line = scanner.nextLine();
+
+            if (line == null) continue;
+            line = line.trim();
+            if (line.isEmpty()) continue;
+
+            if ("/replaylast".equalsIgnoreCase(line)) {
+                replayLast();
+            } else {
+                sendChatMessage(line);
+            }
+        }
+    }
+
+    private void replayLast() throws Exception {
+        if (lastSentPacket == null) {
+            System.out.println("[" + clientId + "] No previous packet to replay.");
+            return;
+        }
+
+        synchronized (out) {
+            out.writeObject(lastSentPacket);
+            out.flush();
+        }
+
+        System.out.println("\n[" + clientId + "] Replayed last packet to KDC.");
+        System.out.println("Recipients should reject it as a replay.\n");
+    }
+
+    private void sendChatMessage(String message) throws Exception {
+        long ts = System.currentTimeMillis();
+        String nonce = Base64.getEncoder().encodeToString(CryptoUtil.randomBytes(16));
+
+        ChatPayload payload = new ChatPayload(clientId, ts, nonce, message);
+        byte[] payloadBytes = CryptoUtil.serializeObject(payload);
+
+        byte[] iv = CryptoUtil.randomBytes(16);
+        byte[] ciphertext = CryptoUtil.aesEncrypt(payloadBytes, groupKey, iv);
+        byte[] signature = CryptoUtil.sign(payloadBytes, myKeyPair.getPrivate());
+
+        ChatPacket packet = new ChatPacket(clientId, iv, ciphertext, signature);
+        lastSentPacket = packet;
+
+        System.out.println("\n=== Protocol message generated by " + clientId + " ===");
+        System.out.println("E(Ks, [ID, timestamp, nonce, M]) = " + CryptoUtil.b64(ciphertext));
+        System.out.println("Sig" + clientId + "(ID, timestamp, nonce, M) = " + CryptoUtil.b64(signature));
+        System.out.println("===============================================\n");
+
+        synchronized (out) {
+            out.writeObject(packet);
+            out.flush();
+        }
+    }
+
+    private void startReceiverThread() {
+        Thread t = new Thread(() -> {
+            try {
+                while (true) {
+                    Object obj = in.readObject();
+                    if (obj instanceof ChatPacket) {
+                        handleIncomingChat((ChatPacket) obj);
+                    }
+                }
+            } catch (Exception e) {
+                System.out.println("[" + clientId + "] Receiver stopped: " + e.getMessage());
+            }
+        });
+
+        t.setDaemon(true);
+        t.start();
+    }
+
+    private void handleIncomingChat(ChatPacket packet) throws Exception {
+        byte[] plaintext = CryptoUtil.aesDecrypt(packet.ciphertext, groupKey, packet.iv);
+        ChatPayload payload = (ChatPayload) CryptoUtil.deserializeObject(plaintext);
+
+        if (!payload.senderId.equals(packet.senderId)) {
+            System.out.println("[" + clientId + "] Rejected packet: sender mismatch.");
+            return;
+        }
+
+        PublicKey senderPub = publicKeyDirectory.get(payload.senderId);
+        if (senderPub == null) {
+            System.out.println("[" + clientId + "] Rejected packet: unknown sender public key.");
+            return;
+        }
+
+        boolean sigOk = CryptoUtil.verify(plaintext, packet.signature, senderPub);
+        if (!sigOk) {
+            System.out.println("[" + clientId + "] Rejected packet: bad digital signature.");
+            return;
+        }
+
+        long now = System.currentTimeMillis();
+        if (Math.abs(now - payload.timestamp) > MAX_CLOCK_SKEW_MS) {
+            System.out.println("[" + clientId + "] Rejected packet from " + payload.senderId + ": stale timestamp.");
+            return;
+        }
+
+        if (replayCache.alreadySeen(payload.senderId, payload.nonce)) {
+            System.out.println("[" + clientId + "] Rejected replayed packet from " + payload.senderId + ".");
+            return;
+        }
+
+        System.out.println("[" + clientId + "] Message received from " + payload.senderId);
+        System.out.println("[" + clientId + "] Decryption: SUCCESS");
+        System.out.println("[" + clientId + "] Signature verification: SUCCESS");
+        System.out.println("[" + clientId + "] Plaintext message: " + payload.message + "\n");
+    }
+}
